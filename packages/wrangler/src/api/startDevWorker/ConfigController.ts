@@ -1,4 +1,5 @@
 import assert from "node:assert";
+import { statSync } from "node:fs";
 import path from "node:path";
 import {
 	createContainerDevPlan,
@@ -26,6 +27,7 @@ import { getEntry } from "../../deployment-bundle/entry";
 import { validateNodeCompatMode } from "../../deployment-bundle/node-compat";
 import { getBindings, getHostAndRoutes, getInferredHost } from "../../dev";
 import { getDurableObjectClassNameToUseSQLiteMap } from "../../dev/class-names-sqlite";
+import { getVarsForDevFilePaths } from "../../dev/dev-vars";
 import { getLocalPersistencePath } from "../../dev/get-local-persistence-path";
 import { getFlag } from "../../experimental-flags";
 import { logger, runWithLogLevel } from "../../logger";
@@ -691,40 +693,63 @@ export class ConfigController extends Controller {
 	// Sorted, so that the same set of paths always compares equal.
 	#configWatcherPaths: string[] = [];
 	#configWatcherReady?: Promise<void>;
+	// Watches the `.dev.vars` and `.env` files that the bindings are read from.
+	// It is a separate watcher so that its directory watches cannot throttle
+	// the config file's `change` events.
+	#varsWatcher?: ReturnType<typeof watch>;
+	#varsWatcherPaths: string[] = [];
+	#varsWatcherReady?: Promise<void>;
 	#abortController?: AbortController;
 
 	// Resolves once every path in `configPaths` is being watched, so that any
 	// change made afterwards emits a `change` event. A change made before a
 	// path's watcher is ready goes unnoticed, which is why an unchanged set of
 	// paths keeps its existing watcher rather than getting a new one.
-	async #ensureWatchingConfig(configPaths: string[], signal: AbortSignal) {
+	async #ensureWatchingConfig(
+		configPaths: string[],
+		varsFilePaths: string[],
+		signal: AbortSignal
+	) {
 		const paths = [...configPaths].sort();
-		const unchanged =
-			paths.length === this.#configWatcherPaths.length &&
-			paths.every((p, i) => p === this.#configWatcherPaths[i]);
-		if (!unchanged) {
-			// Update all the state before awaiting anything, so that a concurrent
-			// update sees the new watcher rather than creating another one.
-			const previousWatcher = this.#configWatcher;
-			this.#configWatcher = undefined;
-			this.#configWatcherReady = undefined;
-			this.#configWatcherPaths = paths;
-			if (paths.length > 0) {
-				const watcher = this.#watchConfig(paths);
-				this.#configWatcher = watcher;
-				this.#configWatcherReady = new Promise((resolve) =>
-					watcher.once("ready", () => resolve())
-				);
+		const varsPaths = [...varsFilePaths].sort();
+		// Each watcher is only replaced when its own paths change, so that e.g.
+		// switching `--env` does not briefly stop watching the config file.
+		// Update all the state before awaiting anything, so that a concurrent
+		// update sees the new watchers rather than creating more.
+		const previousWatchers: ReturnType<typeof watch>[] = [];
+		if (!isSameList(paths, this.#configWatcherPaths)) {
+			if (this.#configWatcher) {
+				previousWatchers.push(this.#configWatcher);
 			}
-			await previousWatcher?.close();
+			this.#configWatcherPaths = paths;
+			this.#configWatcher =
+				paths.length > 0 ? this.#watchConfig(paths) : undefined;
+			this.#configWatcherReady = this.#configWatcher
+				? whenReady(this.#configWatcher)
+				: undefined;
 		}
-		const ready = this.#configWatcherReady;
-		if (ready !== undefined && !signal.aborted) {
+		if (!isSameList(varsPaths, this.#varsWatcherPaths)) {
+			if (this.#varsWatcher) {
+				previousWatchers.push(this.#varsWatcher);
+			}
+			this.#varsWatcherPaths = varsPaths;
+			this.#varsWatcher =
+				varsPaths.length > 0 ? this.#watchVarsFiles(varsPaths) : undefined;
+			this.#varsWatcherReady = this.#varsWatcher
+				? whenReady(this.#varsWatcher)
+				: undefined;
+		}
+		await Promise.all(previousWatchers.map((watcher) => watcher.close()));
+		const ready = Promise.all([
+			this.#configWatcherReady,
+			this.#varsWatcherReady,
+		]);
+		if (!signal.aborted) {
 			// A superseding update or teardown aborts `signal`, possibly by closing
-			// the watcher before it is ready, so stop waiting then.
+			// a watcher before it is ready, so stop waiting then.
 			await new Promise<void>((resolve) => {
 				signal.addEventListener("abort", () => resolve());
-				void ready.then(resolve);
+				void ready.then(() => resolve());
 			});
 		}
 	}
@@ -739,24 +764,65 @@ export class ConfigController extends Controller {
 			// avoids reading a partly written file.
 			awaitWriteFinish: { stabilityThreshold: 50, pollInterval: 10 },
 		});
-		return watcher.on("change", async (changedPath) => {
-			if (watcher.closed) {
-				return;
+		return watcher.on("change", (changedPath) => {
+			if (!watcher.closed) {
+				this.#reloadAfterChange(changedPath);
 			}
-			logger.debug(`${path.basename(changedPath)} changed...`);
-			assert(
-				this.latestInput,
-				"Cannot be watching config without having first set an input"
-			);
-			logger.debug("config file changed", changedPath);
-			this.#updateConfig(this.latestInput).catch((err) => {
-				this.emitErrorEvent({
-					type: "error",
-					reason: "Error resolving config after change",
-					cause: castErrorCause(err),
-					source: "ConfigController",
-					data: undefined,
-				});
+		});
+	}
+
+	// chokidar does not reliably notice a missing file being created, or a
+	// deleted one coming back, when it watches the file itself. So this watches
+	// the directories that the files live in, ignoring every other entry.
+	// Creating or deleting one of these files matters too, since it can change
+	// which file is read (e.g. a new `.dev.vars.<env>` replaces `.dev.vars`).
+	// Only directories that exist are watched: a file in a directory that does
+	// not exist yet (e.g. a mistyped `--env-file`) is not picked up.
+	#watchVarsFiles(paths: string[]): ReturnType<typeof watch> | undefined {
+		const varsFileKeys = new Set(paths.map(toPathKey));
+		const directories = [...new Set(paths.map((p) => path.dirname(p)))].filter(
+			isDirectory
+		);
+		if (directories.length === 0) {
+			// chokidar never emits `ready` for an empty list of paths.
+			return undefined;
+		}
+		const directoryKeys = new Set(directories.map(toPathKey));
+		const watcher = watch(directories, {
+			persistent: true,
+			ignoreInitial: true,
+			depth: 0,
+			ignored: (ignoredPath) => {
+				const key = toPathKey(path.normalize(ignoredPath));
+				return !directoryKeys.has(key) && !varsFileKeys.has(key);
+			},
+			awaitWriteFinish: { stabilityThreshold: 50, pollInterval: 10 },
+		});
+		return watcher.on("all", (event, changedPath) => {
+			if (
+				!watcher.closed &&
+				(event === "add" || event === "change" || event === "unlink") &&
+				varsFileKeys.has(toPathKey(changedPath))
+			) {
+				this.#reloadAfterChange(changedPath);
+			}
+		});
+	}
+
+	#reloadAfterChange(changedPath: string) {
+		logger.debug(`${path.basename(changedPath)} changed...`);
+		assert(
+			this.latestInput,
+			"Cannot be watching config without having first set an input"
+		);
+		logger.debug("config file changed", changedPath);
+		this.#updateConfig(this.latestInput).catch((err) => {
+			this.emitErrorEvent({
+				type: "error",
+				reason: "Error resolving config after change",
+				cause: castErrorCause(err),
+				source: "ConfigController",
+				data: undefined,
 			});
 		});
 	}
@@ -845,7 +911,17 @@ export class ConfigController extends Controller {
 					watchPaths = [fileConfig.configPath];
 				}
 			}
-			await this.#ensureWatchingConfig(watchPaths, signal);
+			// `.dev.vars` and `.env` files feed the Worker's bindings just like the
+			// config file does, so edits to them must also trigger a reload.
+			const varsFilePaths =
+				watchPaths.length > 0
+					? getVarsForDevFilePaths(
+							fileConfig.userConfigPath,
+							input.envFiles,
+							input.env
+						)
+					: [];
+			await this.#ensureWatchingConfig(watchPaths, varsFilePaths, signal);
 
 			// Under `--experimental-new-config`, run the new-config type-gen path
 			// instead of the legacy `checkTypesDiff`.
@@ -911,10 +987,16 @@ export class ConfigController extends Controller {
 		logger.debug("ConfigController teardown beginning...");
 		await super.teardown();
 		this.#abortController?.abort();
-		await this.#configWatcher?.close();
+		await Promise.all([
+			this.#configWatcher?.close(),
+			this.#varsWatcher?.close(),
+		]);
 		this.#configWatcher = undefined;
+		this.#varsWatcher = undefined;
 		this.#configWatcherReady = undefined;
+		this.#varsWatcherReady = undefined;
 		this.#configWatcherPaths = [];
+		this.#varsWatcherPaths = [];
 		logger.debug("ConfigController teardown complete");
 	}
 
@@ -925,4 +1007,53 @@ export class ConfigController extends Controller {
 	emitConfigUpdateEvent(config: StartDevWorkerOptions) {
 		this.bus.dispatch({ type: "configUpdate", config });
 	}
+}
+
+/**
+ * Check whether two sorted lists of paths are the same.
+ *
+ * @param a - The first sorted list.
+ * @param b - The second sorted list.
+ * @returns `true` if both lists hold the same paths in the same order.
+ */
+function isSameList(a: string[], b: string[]): boolean {
+	return a.length === b.length && a.every((p, i) => p === b[i]);
+}
+
+/**
+ * Wait for a watcher's initial scan to finish.
+ *
+ * @param watcher - The chokidar watcher.
+ * @returns A promise that resolves once the watcher is `ready`.
+ */
+function whenReady(watcher: ReturnType<typeof watch>): Promise<void> {
+	return new Promise((resolve) => watcher.once("ready", () => resolve()));
+}
+
+/**
+ * Check whether a path is an existing directory.
+ *
+ * @param directory - The path to check.
+ * @returns `true` if `directory` exists and is a directory.
+ */
+function isDirectory(directory: string): boolean {
+	try {
+		return statSync(directory).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Get a key for comparing paths. Paths are compared case-insensitively on
+ * Windows and macOS, whose file systems are usually case-insensitive, so that
+ * e.g. a `.ENV` file still matches `.env`.
+ *
+ * @param filePath - The path to compare.
+ * @returns The comparison key for `filePath`.
+ */
+function toPathKey(filePath: string): string {
+	return process.platform === "win32" || process.platform === "darwin"
+		? filePath.toLowerCase()
+		: filePath;
 }

@@ -6,7 +6,10 @@ import { logger } from "../logger";
 import type { Binding, Logger } from "@cloudflare/workers-utils";
 import type { Config } from "@cloudflare/workers-utils/config";
 
-export { getDefaultEnvFiles } from "@cloudflare/dev-helpers/dev-vars";
+export {
+	getDefaultEnvFiles,
+	getVarsForDevFilePaths,
+} from "@cloudflare/dev-helpers/dev-vars";
 
 /** Load development variables with Wrangler's logger. */
 export function getVarsForDev(

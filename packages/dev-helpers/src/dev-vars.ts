@@ -146,6 +146,40 @@ export function getVarsForDev(
 }
 
 /**
+ * Get the files that `getVarsForDev()` may read for the given config, so that a
+ * dev server can watch them and pick up edits.
+ *
+ * This includes candidates that do not exist yet: creating or deleting one can
+ * change which file `getVarsForDev()` reads.
+ *
+ * @param configPath - The path to the Wrangler configuration file, if defined.
+ * @param envFiles - The explicit .env file paths, if any (see `getVarsForDev()`).
+ * @param env - The specific environment name, or `undefined` if none is set.
+ * @returns Absolute paths of every `.dev.vars` and `.env` file that `getVarsForDev()` could read.
+ */
+export function getVarsForDevFilePaths(
+	configPath: string | undefined,
+	envFiles: string[] | undefined,
+	env: string | undefined
+): string[] {
+	const configDir = path.resolve(configPath ? path.dirname(configPath) : ".");
+	const paths: string[] = [];
+	if (!envFiles?.length) {
+		const devVarsPath = path.resolve(configDir, ".dev.vars");
+		if (env !== undefined) {
+			paths.push(`${devVarsPath}.${env}`);
+		}
+		paths.push(devVarsPath);
+	}
+	if (getCloudflareLoadDevVarsFromDotEnv()) {
+		for (const envFile of envFiles ?? getDefaultEnvFiles(env)) {
+			paths.push(path.resolve(configDir, envFile));
+		}
+	}
+	return paths;
+}
+
+/**
  * Convert a raw config var value to a VarBinding (plain_text or json).
  */
 function toVarBinding(value: string | Json): VarBinding {

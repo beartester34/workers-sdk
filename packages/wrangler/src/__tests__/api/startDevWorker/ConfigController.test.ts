@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import path from "node:path";
 import { runInTempDir, seed } from "@cloudflare/workers-utils/test-helpers";
 import dedent from "ts-dedent";
@@ -756,5 +757,201 @@ describe("ConfigController", () => {
 			await writeConfig(edit);
 			await expect(update).resolves.toBeDefined();
 		}
+	});
+
+	describe("watching .dev.vars and .env files", () => {
+		const secretUpdate = (value: string) =>
+			bus.waitFor(
+				"configUpdate",
+				(e) =>
+					e.config.bindings?.MY_SECRET?.type === "secret_text" &&
+					e.config.bindings.MY_SECRET.value === value
+			);
+
+		beforeEach(async () => {
+			vi.stubEnv("WRANGLER_CI_DISABLE_CONFIG_WATCHING", "false");
+			await seed({
+				"src/index.js": "export default {}",
+				"wrangler.toml": dedent /* toml */ `
+					name = "my-worker"
+					main = "src/index.js"
+					compatibility_date = "2024-06-01"
+
+					[env.staging]
+				`,
+			});
+		});
+
+		it("should re-resolve bindings when .dev.vars changes", async ({
+			expect,
+		}) => {
+			await seed({ ".dev.vars": "MY_SECRET=one" });
+			const initial = secretUpdate("one");
+			await controller.set({ config: "./wrangler.toml" });
+			await initial;
+
+			const update = secretUpdate("two");
+			await seed({ ".dev.vars": "MY_SECRET=two" });
+			await expect(update).resolves.toBeDefined();
+		});
+
+		it("should switch to .dev.vars.<env> when it is created", async ({
+			expect,
+		}) => {
+			await seed({ ".dev.vars": "MY_SECRET=base" });
+			const initial = secretUpdate("base");
+			await controller.set({ config: "./wrangler.toml", env: "staging" });
+			await initial;
+
+			const update = secretUpdate("staging");
+			await seed({ ".dev.vars.staging": "MY_SECRET=staging" });
+			await expect(update).resolves.toBeDefined();
+		});
+
+		it("should fall back to .env when .dev.vars is deleted", async ({
+			expect,
+		}) => {
+			await seed({
+				".dev.vars": "MY_SECRET=dev-vars",
+				".env": "MY_SECRET=dot-env",
+			});
+			const initial = secretUpdate("dev-vars");
+			await controller.set({ config: "./wrangler.toml" });
+			await initial;
+
+			const update = secretUpdate("dot-env");
+			await rm(".dev.vars");
+			await expect(update).resolves.toBeDefined();
+		});
+
+		it("should pick up a .env file created after starting", async ({
+			expect,
+		}) => {
+			const initial = bus.waitFor("configUpdate");
+			await controller.set({ config: "./wrangler.toml" });
+			await initial;
+			const update = secretUpdate("from-env");
+			await seed({ ".env": "MY_SECRET=from-env" });
+			await expect(update).resolves.toBeDefined();
+		});
+
+		it("should pick up a .env.local file created next to .env", async ({
+			expect,
+		}) => {
+			await seed({ ".env": "MY_SECRET=env" });
+			const initial = secretUpdate("env");
+			await controller.set({ config: "./wrangler.toml" });
+			await initial;
+			const update = secretUpdate("env-local");
+			await seed({ ".env.local": "MY_SECRET=env-local" });
+			await expect(update).resolves.toBeDefined();
+		});
+
+		it("should keep watching .dev.vars after it is deleted and recreated", async ({
+			expect,
+		}) => {
+			await seed({ ".dev.vars": "MY_SECRET=one" });
+			const initial = secretUpdate("one");
+			await controller.set({ config: "./wrangler.toml" });
+			await initial;
+			const gone = bus.waitFor(
+				"configUpdate",
+				(e) => e.config.bindings?.MY_SECRET === undefined
+			);
+			await rm(".dev.vars");
+			await gone;
+			const back = secretUpdate("two");
+			await seed({ ".dev.vars": "MY_SECRET=two" });
+			await expect(back).resolves.toBeDefined();
+			const edited = secretUpdate("three");
+			await seed({ ".dev.vars": "MY_SECRET=three" });
+			await expect(edited).resolves.toBeDefined();
+		});
+
+		it("should notice a .dev.vars file created as soon as the config is applied", async ({
+			expect,
+		}) => {
+			chokidarMock.initialScanDelayMs = 500;
+			const initial = bus.waitFor("configUpdate");
+			await controller.set({ config: "./wrangler.toml" });
+			await initial;
+
+			const update = secretUpdate("one");
+			await seed({ ".dev.vars": "MY_SECRET=one" });
+			await expect(update).resolves.toBeDefined();
+		});
+
+		it("should still watch --env-file paths when one is in a missing directory", async ({
+			expect,
+		}) => {
+			await seed({ "custom.env": "MY_SECRET=one" });
+			const initial = secretUpdate("one");
+			await controller.set({
+				config: "./wrangler.toml",
+				envFiles: ["missing/other.env", "custom.env"],
+			});
+			await initial;
+
+			const update = secretUpdate("two");
+			await seed({ "custom.env": "MY_SECRET=two" });
+			await expect(update).resolves.toBeDefined();
+		});
+
+		it("should keep watching the config file when the environment changes", async ({
+			expect,
+		}) => {
+			await seed({ ".dev.vars": "MY_SECRET=one" });
+			const initial = secretUpdate("one");
+			await controller.set({ config: "./wrangler.toml" });
+			await initial;
+			const switched = bus.waitFor("configUpdate");
+			await controller.patch({ env: "staging" });
+			await switched;
+
+			const update = bus.waitFor(
+				"configUpdate",
+				(e) =>
+					e.config.bindings?.EDIT?.type === "plain_text" &&
+					e.config.bindings.EDIT.value === "1"
+			);
+			await seed({
+				"wrangler.toml": dedent /* toml */ `
+					name = "my-worker"
+					main = "src/index.js"
+					compatibility_date = "2024-06-01"
+
+					[env.staging]
+					vars = { EDIT = "1" }
+				`,
+			});
+			await expect(update).resolves.toBeDefined();
+		});
+
+		it("should start when every --env-file is in a missing directory", async ({
+			expect,
+		}) => {
+			await expect(
+				controller.set({
+					config: "./wrangler.toml",
+					envFiles: ["missing/only.env"],
+				})
+			).resolves.toBeDefined();
+		});
+
+		it("should re-resolve bindings when an --env-file changes", async ({
+			expect,
+		}) => {
+			await seed({ "custom.env": "MY_SECRET=one" });
+			const initial = secretUpdate("one");
+			await controller.set({
+				config: "./wrangler.toml",
+				envFiles: ["custom.env"],
+			});
+			await initial;
+
+			const update = secretUpdate("two");
+			await seed({ "custom.env": "MY_SECRET=two" });
+			await expect(update).resolves.toBeDefined();
+		});
 	});
 });
